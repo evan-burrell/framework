@@ -3,7 +3,10 @@
 namespace Illuminate\Tests\Queue;
 
 use Illuminate\Container\Container;
+use Illuminate\Contracts\Cache\Lock;
+use Illuminate\Contracts\Cache\Repository as CacheRepository;
 use Illuminate\Contracts\Queue\Queue;
+use Illuminate\Contracts\Queue\ShouldBeUnique;
 use Illuminate\Contracts\Queue\ShouldQueueAfterCommit;
 use Illuminate\Database\DatabaseTransactionsManager;
 use Illuminate\Events\Dispatcher;
@@ -73,7 +76,6 @@ class FailoverQueueTest extends TestCase
 
     public function test_after_commit_job_fails_over_when_the_transaction_commits()
     {
-
         $job = new FailoverAfterCommitJob;
         $pushedToSync = false;
 
@@ -104,7 +106,6 @@ class FailoverQueueTest extends TestCase
 
     public function test_after_commit_job_delayed_with_later_fails_over_when_the_transaction_commits()
     {
-
         $job = new FailoverAfterCommitJob;
         $delayedOnSync = false;
 
@@ -131,7 +132,6 @@ class FailoverQueueTest extends TestCase
 
     public function test_after_commit_job_is_not_queued_when_the_transaction_rolls_back()
     {
-
         $pushed = false;
 
         $redis = Mockery::mock(Queue::class);
@@ -151,7 +151,6 @@ class FailoverQueueTest extends TestCase
 
     public function test_job_fails_over_when_an_inner_connection_is_configured_to_dispatch_after_commit()
     {
-
         $job = new FailoverJobWithDelayProperty;
         $pushedToSync = false;
 
@@ -179,7 +178,6 @@ class FailoverQueueTest extends TestCase
 
     public function test_job_that_opts_out_of_after_commit_is_pushed_inside_the_transaction()
     {
-
         $job = new FailoverAfterCommitJob;
         $job->afterCommit = false;
 
@@ -198,9 +196,126 @@ class FailoverQueueTest extends TestCase
         $this->assertTrue($pushed);
     }
 
+    public function test_job_is_pushed_inside_the_transaction_when_only_a_secondary_connection_dispatches_after_commit()
+    {
+        $job = new FailoverJobWithDelayProperty;
+        $pushed = false;
+
+        $redis = Mockery::mock(Queue::class);
+        $redis->expects('push')->with($job)->andReturnUsing(function () use (&$pushed) {
+            $pushed = true;
+        });
+
+        [$failover, $transactions] = $this->failoverQueueWithTransactions([
+            'redis' => $redis, 'sync' => new FailoverUnavailableAfterCommitQueue,
+        ]);
+
+        $transactions->begin('default', 1);
+        $failover->push($job);
+
+        $this->assertTrue($pushed);
+    }
+
+    public function test_after_commit_job_that_cannot_be_serialized_throws_inside_the_transaction()
+    {
+        $job = new FailoverAfterCommitJob;
+        $job->callback = fn () => null;
+
+        $redis = Mockery::mock(Queue::class);
+        $redis->expects('push')->never();
+
+        [$failover, $transactions, $failedOver] = $this->failoverQueueWithTransactions(['redis' => $redis]);
+
+        $transactions->begin('default', 1);
+
+        try {
+            $failover->push($job);
+
+            $this->fail('The job should not have been deferred.');
+        } catch (RuntimeException $e) {
+            $this->assertStringContainsString('Failed to serialize job', $e->getMessage());
+        }
+
+        $transactions->commit('default', 1, 0);
+
+        $this->assertCount(0, $failedOver);
+    }
+
+    public function test_after_commit_job_fails_over_once_transactions_on_every_connection_have_committed()
+    {
+        $job = new FailoverAfterCommitJob;
+        $pushedToSync = false;
+
+        $sync = Mockery::mock(Queue::class);
+        $sync->expects('push')->with($job)->andReturnUsing(function () use (&$pushedToSync) {
+            $pushedToSync = true;
+        });
+
+        [$failover, $transactions, $failedOver] = $this->failoverQueueWithTransactions([
+            'redis' => new FailoverUnavailableAfterCommitQueue, 'sync' => $sync,
+        ]);
+
+        $transactions->begin('mysql', 1);
+        $transactions->begin('pgsql', 1);
+        $failover->push($job);
+        $transactions->commit('pgsql', 1, 0);
+
+        $this->assertFalse($pushedToSync);
+        $this->assertCount(0, $failedOver);
+
+        $transactions->commit('mysql', 1, 0);
+
+        $this->assertTrue($pushedToSync);
+        $this->assertCount(1, $failedOver);
+        $this->assertSame('redis', $failedOver[0]->connectionName);
+    }
+
+    public function test_bulk_after_commit_jobs_are_pushed_when_the_transaction_commits()
+    {
+        $jobs = [new FailoverAfterCommitJob, new FailoverAfterCommitJob];
+        $pushed = 0;
+
+        $redis = Mockery::mock(Queue::class);
+        $redis->expects('push')->twice()->andReturnUsing(function () use (&$pushed) {
+            $pushed++;
+        });
+
+        [$failover, $transactions] = $this->failoverQueueWithTransactions(['redis' => $redis]);
+
+        $transactions->begin('default', 1);
+        $failover->bulk($jobs);
+
+        $this->assertSame(0, $pushed);
+
+        $transactions->commit('default', 1, 0);
+
+        $this->assertSame(2, $pushed);
+    }
+
+    public function test_unique_lock_is_released_when_the_transaction_rolls_back()
+    {
+        $redis = Mockery::mock(Queue::class);
+        $redis->expects('push')->never();
+
+        [$failover, $transactions, $failedOver, $container] = $this->failoverQueueWithTransactions(['redis' => $redis]);
+
+        $lock = Mockery::mock(Lock::class);
+        $lock->expects('forceRelease')->once();
+
+        $cache = Mockery::mock(CacheRepository::class);
+        $cache->expects('lock')->once()->andReturn($lock);
+        $container->instance(CacheRepository::class, $cache);
+
+        $transactions->begin('default', 1);
+        $failover->push(new FailoverUniqueAfterCommitJob);
+        $transactions->rollback('default', 0);
+
+        $this->assertCount(0, $failedOver);
+    }
+
     /**
      * @param  array<string, object>  $connections
-     * @return array{0: FailoverQueue, 1: DatabaseTransactionsManager, 2: \ArrayObject}
+     * @return array{0: FailoverQueue, 1: DatabaseTransactionsManager, 2: \ArrayObject, 3: Container}
      */
     protected function failoverQueueWithTransactions(array $connections): array
     {
@@ -221,16 +336,22 @@ class FailoverQueueTest extends TestCase
             $manager->allows('connection')->with($name)->andReturn($queue);
         }
 
-        $failover = new FailoverQueue($manager, $events, ['redis', 'sync']);
+        $failover = new FailoverQueue($manager, $events, array_keys($connections));
         $failover->setContainer($container);
 
-        return [$failover, $transactions, $failedOver];
+        return [$failover, $transactions, $failedOver, $container];
     }
 }
 
 class FailoverAfterCommitJob implements ShouldQueueAfterCommit
 {
     public $afterCommit;
+
+    public $callback;
+}
+
+class FailoverUniqueAfterCommitJob implements ShouldBeUnique, ShouldQueueAfterCommit
+{
 }
 
 class FailoverUnavailableAfterCommitQueue extends BaseQueue

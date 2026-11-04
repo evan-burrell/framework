@@ -10,6 +10,8 @@ use Illuminate\Support\Collection;
 use RuntimeException;
 use Throwable;
 
+use function Illuminate\Support\enum_value;
+
 class FailoverQueue extends Queue implements QueueContract
 {
     /**
@@ -270,24 +272,71 @@ class FailoverQueue extends Queue implements QueueContract
      */
     protected function attemptOnAllConnections(string $method, array $arguments, $job = null)
     {
-        $transactions = $job !== null && isset($this->container) && $this->container->bound('db.transactions')
-            ? $this->container->make('db.transactions')
-            : null;
-
         // An inner connection defers an after-commit push by registering a callback and
         // returning, so the push would fail outside of the failover loop. Deferring the
         // whole attempt instead means it runs once no transaction is open, where the
-        // inner connections' own addCallback() executes the push immediately.
-        if ($transactions?->callbackApplicableTransactions()->isNotEmpty() &&
+        // inner connections' own addCallback() executes the push immediately. Open
+        // transactions are checked first so connections are only resolved if needed.
+        if ($job !== null &&
+            $this->hasCallbackApplicableTransactions() &&
             $this->shouldDispatchAfterCommit($job)) {
-            $this->registerRollbackCallbacksForJobsThatDispatchAfterCommit($job);
+            // Building the payload now surfaces serialization errors inside the transaction,
+            // as an inner connection would, instead of after the data has been committed...
+            $this->createPayloadForAttempt($method, $arguments, $job);
 
-            return $transactions->addCallback(
-                fn () => $this->attemptOnAllConnectionsNow($method, $arguments, $job)
-            );
+            return $this->attemptOnAllConnectionsAfterCommit($method, $arguments, $job);
         }
 
         return $this->attemptOnAllConnectionsNow($method, $arguments, $job);
+    }
+
+    /**
+     * Attempt the given method on all connections once the open transactions have committed.
+     *
+     * @param  mixed  $job
+     * @return mixed
+     */
+    protected function attemptOnAllConnectionsAfterCommit(string $method, array $arguments, $job)
+    {
+        $this->registerRollbackCallbacksForJobsThatDispatchAfterCommit($job);
+
+        return $this->container->make('db.transactions')->addCallback(function () use ($method, $arguments, $job) {
+            // A transaction may still be open on another connection, where an inner connection
+            // would defer the push again, outside of the failover loop, so wait for it too...
+            return $this->hasCallbackApplicableTransactions()
+                ? $this->attemptOnAllConnectionsAfterCommit($method, $arguments, $job)
+                : $this->attemptOnAllConnectionsNow($method, $arguments, $job);
+        });
+    }
+
+    /**
+     * Determine if there are open transactions that after-commit callbacks would wait for.
+     *
+     * @return bool
+     */
+    protected function hasCallbackApplicableTransactions()
+    {
+        return isset($this->container) &&
+            $this->container->bound('db.transactions') &&
+            $this->container->make('db.transactions')->callbackApplicableTransactions()->isNotEmpty();
+    }
+
+    /**
+     * Create the payload for the given job, as the attempted method would.
+     *
+     * @param  mixed  $job
+     * @return string
+     *
+     * @throws \Illuminate\Queue\InvalidPayloadException
+     * @throws \RuntimeException
+     */
+    protected function createPayloadForAttempt(string $method, array $arguments, $job)
+    {
+        [$delay, $data, $queue] = $method === 'later'
+            ? [$arguments[0], $arguments[2] ?? '', $arguments[3] ?? null]
+            : [null, $arguments[1] ?? '', $arguments[2] ?? null];
+
+        return $this->createPayload($job, enum_value($queue), $data, $delay);
     }
 
     /**
@@ -326,30 +375,23 @@ class FailoverQueue extends Queue implements QueueContract
     /**
      * Determine if the job should be dispatched after all database transactions have committed.
      *
-     * The job's own preference wins; otherwise the job is deferred if any of the inner
-     * connections is configured to dispatch after commit.
+     * The job's own preference wins; otherwise the primary connection's configuration
+     * decides, since that is the connection the job is normally pushed to.
      *
      * @param  \Closure|string|object  $job
      * @return bool
      */
     protected function shouldDispatchAfterCommit($job)
     {
-        if (parent::shouldDispatchAfterCommit($job)) {
-            return true;
+        try {
+            $primary = $this->manager->connection($this->connections[0]);
+        } catch (Throwable) {
+            // The failover loop reports the error when it tries this connection...
+            return parent::shouldDispatchAfterCommit($job);
         }
 
-        foreach ($this->connections as $connection) {
-            try {
-                $queue = $this->manager->connection($connection);
-            } catch (Throwable) {
-                continue;
-            }
-
-            if ($queue instanceof Queue && $queue->shouldDispatchAfterCommit($job)) {
-                return true;
-            }
-        }
-
-        return false;
+        return $primary instanceof Queue
+            ? $primary->shouldDispatchAfterCommit($job)
+            : parent::shouldDispatchAfterCommit($job);
     }
 }
