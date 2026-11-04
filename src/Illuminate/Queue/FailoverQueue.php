@@ -270,6 +270,36 @@ class FailoverQueue extends Queue implements QueueContract
      */
     protected function attemptOnAllConnections(string $method, array $arguments, $job = null)
     {
+        $transactions = $job !== null && isset($this->container) && $this->container->bound('db.transactions')
+            ? $this->container->make('db.transactions')
+            : null;
+
+        // An inner connection defers an after-commit push by registering a callback and
+        // returning, so the push would fail outside of the failover loop. Deferring the
+        // whole attempt instead means it runs once no transaction is open, where the
+        // inner connections' own addCallback() executes the push immediately.
+        if ($transactions?->callbackApplicableTransactions()->isNotEmpty() &&
+            $this->shouldDispatchAfterCommit($job)) {
+            $this->registerRollbackCallbacksForJobsThatDispatchAfterCommit($job);
+
+            return $transactions->addCallback(
+                fn () => $this->attemptOnAllConnectionsNow($method, $arguments, $job)
+            );
+        }
+
+        return $this->attemptOnAllConnectionsNow($method, $arguments, $job);
+    }
+
+    /**
+     * Attempt the given method on all connections immediately.
+     *
+     * @param  mixed  $job
+     * @return mixed
+     *
+     * @throws \Throwable
+     */
+    protected function attemptOnAllConnectionsNow(string $method, array $arguments, $job = null)
+    {
         [$lastException, $failedQueues] = [null, []];
 
         try {
@@ -291,5 +321,35 @@ class FailoverQueue extends Queue implements QueueContract
         }
 
         throw $lastException ?? new RuntimeException('All failover queue connections failed.');
+    }
+
+    /**
+     * Determine if the job should be dispatched after all database transactions have committed.
+     *
+     * The job's own preference wins; otherwise the job is deferred if any of the inner
+     * connections is configured to dispatch after commit.
+     *
+     * @param  \Closure|string|object  $job
+     * @return bool
+     */
+    protected function shouldDispatchAfterCommit($job)
+    {
+        if (parent::shouldDispatchAfterCommit($job)) {
+            return true;
+        }
+
+        foreach ($this->connections as $connection) {
+            try {
+                $queue = $this->manager->connection($connection);
+            } catch (Throwable) {
+                continue;
+            }
+
+            if ($queue instanceof Queue && $queue->shouldDispatchAfterCommit($job)) {
+                return true;
+            }
+        }
+
+        return false;
     }
 }
